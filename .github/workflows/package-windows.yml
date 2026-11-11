@@ -99,8 +99,8 @@ jobs:
           archive.unlink()
           '@ | python -
           if ($LASTEXITCODE -ne 0) { throw 'Source decryption failed.' }
-          if ((Get-Content -Raw app/pubspec.yaml) -notmatch '(?m)^version:\s*3\.0\.0\+63\s*$') { throw 'Expected source version 3.0.0+63.' }
-          if (-not (Test-Path -LiteralPath 'runtime/tocodex-base/data/plugins.yml' -PathType Leaf)) { throw 'Magpie runtime base is missing from the source.' }
+          if ((Get-Content -Raw '.build/src/app/pubspec.yaml') -notmatch '(?m)^version:\s*3\.0\.0\+63\s*$') { throw 'Expected source version 3.0.0+63.' }
+          if (-not (Test-Path -LiteralPath '.build/src/runtime/tocodex-base/data/plugins.yml' -PathType Leaf)) { throw 'Magpie runtime base is missing from the source.' }
           @{ sourceCommit = $env:EXPECTED_SOURCE_COMMIT; sourceArchiveSHA256 = $env:EXPECTED_SOURCE_SHA256; version = '3.0.0'; build = 63; repositoryPrivate = $true; realWorkBuddyAcceptance = $false } |
             ConvertTo-Json | Set-Content -LiteralPath (Join-Path $env:BK_EVIDENCE 'source.json') -Encoding ASCII
 
