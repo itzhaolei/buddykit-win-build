@@ -1,0 +1,4 @@
+# 明文构建输入与密钥永不入库
+*.tar.gz
+build-key.b64
+.build/

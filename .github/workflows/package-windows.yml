@@ -1,0 +1,332 @@
+name: Verify and package Windows 3.0.0+63
+
+# 免费打包跑道：公开仓库的 Windows runner 不消耗计费分钟，构建输入是
+# PyNaCl SecretBox 加密的源码归档（.github/release-inputs/），密钥只放在
+# Actions secret BUDDYKIT_BUILD_KEY 里。解密、校验、构建全部在 runner 临时目录，
+# 结束后随环境销毁；本仓库只保留密文与流程定义，不含明文源码。
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: Exact approved private source commit (40 hexadecimal characters)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-3.0.0-63-${{ inputs.source_commit }}
+  cancel-in-progress: false
+
+env:
+  EXPECTED_SOURCE_COMMIT: c26b3d9394d915a67a2440d43a13d2a22b56c1da
+  EXPECTED_SOURCE_SHA256: a82e36d6e498a47ebac81e30b01011ccd5912d07d61dcc287c2f31e236898c75
+
+jobs:
+  windows-release:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: powershell
+        working-directory: .build/src
+    steps:
+      - name: Validate build request
+        id: request
+        working-directory: .
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:SOURCE_COMMIT -notmatch '^[0-9a-f]{40}$') { throw 'An exact source commit is required.' }
+          if ($env:SOURCE_COMMIT -ne $env:EXPECTED_SOURCE_COMMIT) { throw 'Requested commit is not the approved build input.' }
+          if ([string]::IsNullOrWhiteSpace($env:BUILD_KEY)) { throw 'BUDDYKIT_BUILD_KEY secret is missing.' }
+          $env:BK_EVIDENCE = Join-Path $env:RUNNER_TEMP 'buddykit-windows-3.0.0-63-evidence'
+          ('BK_EVIDENCE=' + $env:BK_EVIDENCE) | Out-File -LiteralPath $env:GITHUB_ENV -Encoding utf8 -Append
+          New-Item -ItemType Directory -Path $env:BK_EVIDENCE -Force | Out-Null
+          git config --global core.autocrlf false
+          if ($LASTEXITCODE -ne 0) { throw 'Git configuration failed.' }
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          BUILD_KEY: ${{ secrets.BUDDYKIT_BUILD_KEY }}
+
+      - name: Check out encrypted build input
+        id: checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install decryption dependency
+        working-directory: .
+        run: python -m pip install --disable-pip-version-check --no-cache-dir PyNaCl==1.6.2
+
+      - name: Decrypt and verify the approved source
+        id: source
+        working-directory: .
+        env:
+          BUDDYKIT_BUILD_KEY: ${{ secrets.BUDDYKIT_BUILD_KEY }}
+          SOURCE_ROOT: ${{ github.workspace }}/.build/src
+        run: |
+          $ErrorActionPreference = 'Stop'
+          @'
+          import base64
+          import hashlib
+          import os
+          import tarfile
+          from pathlib import Path
+          from nacl.secret import SecretBox
+
+          key = base64.b64decode(os.environ['BUDDYKIT_BUILD_KEY'], validate=True)
+          if len(key) != SecretBox.KEY_SIZE:
+              raise RuntimeError('Invalid build decryption key length')
+          encrypted = Path('.github/release-inputs/BuddyKit-3.0.0-63.tar.enc').read_bytes()
+          plaintext = SecretBox(key).decrypt(encrypted)
+          expected = os.environ['EXPECTED_SOURCE_SHA256']
+          if hashlib.sha256(plaintext).hexdigest() != expected:
+              raise RuntimeError('Build input checksum does not match the approved source')
+          source = Path(os.environ['SOURCE_ROOT'])
+          source.mkdir(parents=True, exist_ok=True)
+          archive = Path(os.environ['RUNNER_TEMP']) / 'BuddyKit-3.0.0-63-source.tar.gz'
+          archive.write_bytes(plaintext)
+          del plaintext, key, encrypted
+          with tarfile.open(archive, 'r:gz') as bundle:
+              bundle.extractall(source, filter='data')
+          archive.unlink()
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw 'Source decryption failed.' }
+          if ((Get-Content -Raw app/pubspec.yaml) -notmatch '(?m)^version:\s*3\.0\.0\+63\s*$') { throw 'Expected source version 3.0.0+63.' }
+          if (-not (Test-Path -LiteralPath 'runtime/tocodex-base/data/plugins.yml' -PathType Leaf)) { throw 'Magpie runtime base is missing from the source.' }
+          @{ sourceCommit = $env:EXPECTED_SOURCE_COMMIT; sourceArchiveSHA256 = $env:EXPECTED_SOURCE_SHA256; version = '3.0.0'; build = 63; repositoryPrivate = $true; realWorkBuddyAcceptance = $false } |
+            ConvertTo-Json | Set-Content -LiteralPath (Join-Path $env:BK_EVIDENCE 'source.json') -Encoding ASCII
+
+      - name: Set up Flutter
+        id: flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.2'
+          channel: stable
+          cache: true
+
+      - name: Resolve locked dependencies
+        id: pub
+        working-directory: .build/src/app
+        run: |
+          & ..\scripts\ci\run_logged_windows_command.ps1 -Command 'call flutter pub get --enforce-lockfile' -LogPath (Join-Path $env:BK_EVIDENCE 'pub.log')
+          if ($LASTEXITCODE -ne 0) { throw 'Locked dependency resolution failed.' }
+
+      - name: Analyze complete Dart source
+        id: analyze
+        working-directory: .build/src/app
+        run: |
+          & ..\scripts\ci\run_logged_windows_command.ps1 -Command 'call flutter analyze --no-pub' -LogPath (Join-Path $env:BK_EVIDENCE 'analyze.log')
+          if ($LASTEXITCODE -ne 0) { throw 'Dart analysis failed.' }
+
+      - name: Run complete Dart tests
+        id: tests
+        working-directory: .build/src/app
+        run: |
+          & ..\scripts\ci\run_logged_windows_command.ps1 -Command 'call flutter test --no-pub --concurrency=2 --reporter expanded' -LogPath (Join-Path $env:BK_EVIDENCE 'tests.log')
+          if ($LASTEXITCODE -ne 0) { throw 'Complete Dart tests failed.' }
+          $text = Get-Content -Raw (Join-Path $env:BK_EVIDENCE 'tests.log')
+          if ($text -notmatch 'All tests passed!') { throw 'Passing Dart test summary not found.' }
+
+      - name: Parse Windows PowerShell 5.1 scripts and compile updater CSharp
+        id: powershell_contract
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($PSVersionTable.PSVersion.Major -ne 5) { throw 'Windows PowerShell 5.1 is required.' }
+          $source = Get-Content -Raw app/windows/runner/app_updater.cpp
+          $match = [regex]::Match($source, 'R"POWERSHELL\((.*?)\)POWERSHELL"', [System.Text.RegularExpressions.RegexOptions]::Singleline)
+          if (-not $match.Success) { throw 'Updater helper not found.' }
+          $tokens = $null; $errors = $null
+          $null = [System.Management.Automation.Language.Parser]::ParseInput($match.Groups[1].Value, [ref]$tokens, [ref]$errors)
+          if ($errors.Count -ne 0) { throw 'Updater PowerShell parsing failed.' }
+          $csharp = [regex]::Match($match.Groups[1].Value, "Add-Type -TypeDefinition @'\r?\n(.*?)\r?\n'@", [System.Text.RegularExpressions.RegexOptions]::Singleline)
+          if (-not $csharp.Success) { throw 'Updater CSharp helper not found.' }
+          Add-Type -TypeDefinition $csharp.Groups[1].Value
+          foreach ($path in @('scripts/stage_tocodex_runtime_windows.ps1', 'scripts/test_windows_auto_update.ps1', 'scripts/test_windows_app_version.ps1', 'scripts/test_windows_single_instance.ps1', 'scripts/test_windows_workbuddy_runtime.ps1', 'scripts/ci/run_logged_windows_command.ps1', 'scripts/ci/verify_windows_no_uia.ps1')) {
+            $tokens = $null; $errors = $null
+            $null = [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $path).Path, [ref]$tokens, [ref]$errors)
+            if ($errors.Count -ne 0) { throw ('PowerShell parsing failed: ' + $path) }
+          }
+          @{ passed = $true; powershellMajor = 5; updaterCSharpCompiled = $true } | ConvertTo-Json |
+            Set-Content -LiteralPath (Join-Path $env:BK_EVIDENCE 'powershell-contract.json') -Encoding ASCII
+
+      - name: Compile and run native authentication and runtime contracts with MSVC
+        id: native_runtime
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $directory = Join-Path $env:BK_EVIDENCE 'native-runtime'
+          & .\scripts\test_windows_workbuddy_runtime.ps1 -EvidenceDirectory $directory
+          $results = @(Get-ChildItem -LiteralPath $directory -Recurse -Filter result.json)
+          if ($results.Count -ne 1) { throw 'Expected one native runtime result.' }
+          $result = Get-Content -Raw -LiteralPath $results[0].FullName | ConvertFrom-Json
+          if ($result.success -ne $true -or $result.exitCode -ne 0 -or $result.realWorkBuddyAcceptance -ne $false) { throw 'Native runtime contracts failed.' }
+
+      - name: Build Windows release with MSVC
+        id: release
+        working-directory: .build/src/app
+        run: |
+          & ..\scripts\ci\run_logged_windows_command.ps1 -Command 'call flutter build windows --no-pub --release --build-name=3.0.0 --build-number=63' -LogPath (Join-Path $env:BK_EVIDENCE 'release.log')
+          if ($LASTEXITCODE -ne 0) { throw 'Windows release compilation failed.' }
+          $bundle = 'build/windows/x64/runner/Release'
+          foreach ($file in @('buddykit.exe', 'flutter_windows.dll', 'msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll', 'data/app.so', 'data/flutter_assets/assets/tray_icon.ico')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $bundle $file) -PathType Leaf)) { throw ('Missing runtime file: ' + $file) }
+          }
+          if ((Get-Item (Join-Path $bundle 'buddykit.exe')).VersionInfo.ProductVersion -ne '3.0.0+63') { throw 'Executable version/build mismatch.' }
+
+      - name: Stage magpie runtime into the release bundle
+        id: stage_runtime
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & .\scripts\stage_tocodex_runtime_windows.ps1 `
+            -BuildDir (Resolve-Path app/build/windows/x64/runner/Release).Path `
+            -BaseDir (Resolve-Path runtime/tocodex-base).Path `
+            -MagpieVersion 'v0.1.2945' -BunVersion '1.4.4'
+          @{ passed = $true; magpieVersion = 'v0.1.2945'; bunVersion = '1.4.4' } |
+            ConvertTo-Json | Set-Content -LiteralPath (Join-Path $env:BK_EVIDENCE 'stage-runtime.json') -Encoding ASCII
+
+      - name: Exclude product UIA controls and debugger bridges
+        id: native_no_uia
+        run: |
+          & .\scripts\ci\verify_windows_no_uia.ps1 -SourceRoot (Get-Location).Path -BundlePath (Resolve-Path app/build/windows/x64/runner/Release).Path -EvidencePath (Join-Path $env:BK_EVIDENCE 'native-no-uia.json') -ExpectedVersion '3.0.0' -ExpectedBuild 63
+
+      - name: Verify real sidebar version
+        id: version
+        run: |
+          & .\scripts\test_windows_app_version.ps1 -ExecutablePath (Resolve-Path app/build/windows/x64/runner/Release/buddykit.exe).Path -EvidenceDirectory (Join-Path $env:BK_EVIDENCE 'version')
+
+      - name: Verify single-instance and tray lifecycle
+        id: single_instance
+        run: |
+          & .\scripts\test_windows_single_instance.ps1 -ExecutablePath (Resolve-Path app/build/windows/x64/runner/Release/buddykit.exe).Path
+          @{ passed = $true } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $env:BK_EVIDENCE 'single-instance.json') -Encoding ASCII
+
+      - name: Require every validation outcome before packaging
+        id: prepackage_gate
+        if: always()
+        env:
+          STEP_RESULTS: ${{ toJSON(steps) }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $steps = $env:STEP_RESULTS | ConvertFrom-Json
+          $required = @('request', 'checkout', 'source', 'flutter', 'pub', 'analyze', 'tests', 'powershell_contract', 'native_runtime', 'release', 'stage_runtime', 'native_no_uia', 'version', 'single_instance')
+          $outcomes = [ordered]@{}
+          foreach ($key in $required) {
+            $property = $steps.PSObject.Properties[$key]
+            $outcomes[$key] = if ($null -eq $property) { 'missing' } else { $property.Value.outcome }
+          }
+          $outcomes | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $env:BK_EVIDENCE 'validation-outcomes.json') -Encoding ASCII
+          if (@($outcomes.Values | Where-Object { $_ -ne 'success' }).Count -ne 0) { throw 'A required validation did not succeed; installer packaging is forbidden.' }
+
+      - name: Build Inno Setup installer
+        id: installer
+        if: steps.prepackage_gate.outcome == 'success'
+        run: |
+          & .\scripts\ci\run_logged_windows_command.ps1 -Command 'iscc /DMyAppVersion=3.0.0 packaging\windows\BuddyKit.iss' -LogPath (Join-Path $env:BK_EVIDENCE 'installer.log')
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath dist/BuddyKit-3.0.0-Setup.exe -PathType Leaf)) { throw 'Installer packaging failed.' }
+
+      - name: Install packaged application into an isolated directory
+        id: install_smoke
+        if: steps.installer.outcome == 'success'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = (Resolve-Path dist/BuddyKit-3.0.0-Setup.exe).Path
+          $destination = Join-Path $env:RUNNER_TEMP 'BuddyKit-installed-3.0.0-63'
+          $process = Start-Process -FilePath $installer -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', ('/DIR="' + $destination + '"')) -PassThru
+          if (-not $process.WaitForExit(120000)) { $process.Kill(); throw 'Installer timed out.' }
+          if ($process.ExitCode -ne 0) { throw 'Installer did not complete successfully.' }
+          $installed = Join-Path $destination 'buddykit.exe'
+          if ((Get-Item -LiteralPath $installed).VersionInfo.ProductVersion -ne '3.0.0+63') { throw 'Installed executable version mismatch.' }
+          $expectedHash = (Get-FileHash app/build/windows/x64/runner/Release/buddykit.exe -Algorithm SHA256).Hash
+          if ((Get-FileHash -LiteralPath $installed -Algorithm SHA256).Hash -ne $expectedHash) { throw 'Installed executable differs from verified release.' }
+          # The To gateway needs the magpie runtime beside the executable.
+          foreach ($file in @('buddykit\magpie.exe', 'buddykit\.portable', 'buddykit\data\plugins.yml', 'buddykit\data\cache\bun\1.4.4\magpie-bun.exe', 'buddykit\sync\package.json')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $destination $file))) { throw ('Installed bundle is missing magpie runtime file: ' + $file) }
+          }
+          & .\scripts\test_windows_app_version.ps1 -ExecutablePath $installed -EvidenceDirectory (Join-Path $env:BK_EVIDENCE 'installed-version')
+          @{ passed = $true; installerExitCode = $process.ExitCode; installedProductVersion = '3.0.0+63'; executableSHA256 = $expectedHash.ToLowerInvariant(); magpieRuntimeStaged = $true } |
+            ConvertTo-Json | Set-Content -LiteralPath (Join-Path $env:BK_EVIDENCE 'install-smoke.json') -Encoding ASCII
+
+      - name: Require all gates and record final installer identity
+        id: final_gate
+        if: always()
+        env:
+          STEP_RESULTS: ${{ toJSON(steps) }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Path $env:BK_EVIDENCE -Force | Out-Null
+          $steps = $env:STEP_RESULTS | ConvertFrom-Json
+          $required = @('request', 'checkout', 'source', 'flutter', 'pub', 'analyze', 'tests', 'powershell_contract', 'native_runtime', 'release', 'stage_runtime', 'native_no_uia', 'version', 'single_instance', 'prepackage_gate', 'installer', 'install_smoke')
+          $outcomes = [ordered]@{}
+          foreach ($key in $required) {
+            $property = $steps.PSObject.Properties[$key]
+            $outcomes[$key] = if ($null -eq $property) { 'missing' } else { $property.Value.outcome }
+          }
+          $passed = @($outcomes.Values | Where-Object { $_ -ne 'success' }).Count -eq 0
+          $result = [ordered]@{ success = $passed; sourceCommit = $env:EXPECTED_SOURCE_COMMIT; workflowCommit = $env:GITHUB_SHA; runId = $env:GITHUB_RUN_ID; runAttempt = $env:GITHUB_RUN_ATTEMPT; version = '3.0.0'; build = 63; outcomes = $outcomes; realWorkBuddyAcceptance = $false; actualWebsiteButtonUpdate = 'pending publication of official 3.0.0+63 feed' }
+          if ($passed) {
+            $file = Get-Item -LiteralPath dist/BuddyKit-3.0.0-Setup.exe
+            $result['installer'] = @{ name = $file.Name; size = $file.Length; sha256 = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant() }
+          }
+          $result | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $env:BK_EVIDENCE 'result.json') -Encoding ASCII
+          if (-not $passed) { throw 'A required raw step outcome failed or is missing; installer upload is forbidden.' }
+
+      - name: Seal verified installer for transport
+        id: seal_installer
+        if: steps.final_gate.outcome == 'success'
+        env:
+          BUDDYKIT_BUILD_KEY: ${{ secrets.BUDDYKIT_BUILD_KEY }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          @'
+          import base64
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          from nacl.secret import SecretBox
+
+          key = base64.b64decode(os.environ['BUDDYKIT_BUILD_KEY'], validate=True)
+          source = Path('dist/BuddyKit-3.0.0-Setup.exe')
+          raw = source.read_bytes()
+          sealed = source.with_suffix('.exe.enc')
+          sealed.write_bytes(SecretBox(key).encrypt(raw))
+          Path('dist/sealed.json').write_text(json.dumps({
+              'name': source.name,
+              'size': len(raw),
+              'sha256': hashlib.sha256(raw).hexdigest(),
+              'sealedSize': sealed.stat().st_size,
+          }, indent=2), encoding='utf-8')
+          print('sealed', sealed.stat().st_size, 'bytes')
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw 'Installer sealing failed.' }
+
+      - name: Upload sealed installer only
+        id: upload_installer
+        if: steps.seal_installer.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: BuddyKit-windows-installer-3.0.0-63
+          path: |
+            ${{ github.workspace }}/.build/src/dist/BuddyKit-3.0.0-Setup.exe.enc
+            ${{ github.workspace }}/.build/src/dist/sealed.json
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload bounded validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: BuddyKit-windows-evidence-3.0.0-63
+          path: |
+            ${{ runner.temp }}/buddykit-windows-3.0.0-63-evidence/**/*.json
+            ${{ runner.temp }}/buddykit-windows-3.0.0-63-evidence/**/*.log
+            ${{ runner.temp }}/buddykit-windows-3.0.0-63-evidence/**/*.png
+          if-no-files-found: ignore
+          retention-days: 7
