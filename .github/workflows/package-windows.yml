@@ -21,8 +21,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  EXPECTED_SOURCE_COMMIT: 0fdc321c16e20e564bb1aab7162263c07538d01f
-  EXPECTED_SOURCE_SHA256: bb89ab47be5e8ae1d57e90128814204116c4d5d8cdbf10bcbe7885ae0eee0943
+  EXPECTED_SOURCE_COMMIT: b3fd9f71a0bb72e90bd81929f489922a04ddced9
+  EXPECTED_SOURCE_SHA256: a4a2c4ac1be64cbaf357f682d0dbd87b19b3300100fdfda003200c4eebbb12eb
 
 jobs:
   windows-release:
